@@ -3,21 +3,36 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <DHT.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <WiFiClient.h>
+#include <ArduinoHttpClient.h>
 
 // Motor driver pins
 const int IN1 = 9;
-const int IN2 = 10; 
-const int IN3 = 11; 
-const int IN4 = 12; 
+const int IN2 = 10;
+const int IN3 = 11;
+const int IN4 = 12;
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000); // UTC time
+
+int counter = 0;
 
 // WiFi credentials
 const char* ssid = "iotroam";
 const char* password = "qNeW73lAUG";
+const int port = 5000;
+WiFiServer server(port);
 
 // MQTT Broker
-const char* mqtt_server = "145.93.236.62";
+const char* mqtt_server = "145.93.236.67";
 const int mqtt_port = 1883;
 const char* mqtt_topic = "sensor/data";
+
+// Replace these with your actual API server details
+const char* serverAddress = "145.93.236.67"; // Use the same host as the database
+const int serverPort = 5000; // Your API's port (5000 is commonly used for development)
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -43,42 +58,20 @@ private:
     int airQuality;
 
 public:
-    // Constructor
     SensorData() : temperature(0), humidity(0), airQuality(0) {}
 
-    // Setters
-    void setTemperature(float temp) {
-        temperature = temp;
-    }
+    void setTemperature(float temp) { temperature = temp; }
+    void setHumidity(float hum) { humidity = hum; }
+    void setAirQuality(int airQ) { airQuality = airQ; }
 
-    void setHumidity(float hum) {
-        humidity = hum;
-    }
+    float getTemperature() const { return temperature; }
+    float getHumidity() const { return humidity; }
+    int getAirQuality() const { return airQuality; }
 
-    void setAirQuality(int airQ) {
-        airQuality = airQ;
-    }
-
-    // Getters
-    float getTemperature() const {
-        return temperature;
-    }
-
-    float getHumidity() const {
-        return humidity;
-    }
-
-    int getAirQuality() const {
-        return airQuality;
-    }
-
-    // Method to get the all the data into a string.
     String toJSON() const {
-        String json = "{";
-        json += "\"temperature\":" + String(temperature) + ",";
+        String json = "{\"temperature\":" + String(temperature) + ",";
         json += "\"humidity\":" + String(humidity) + ",";
-        json += "\"airQuality\":" + String(airQuality);
-        json += "}";
+        json += "\"airQuality\":" + String(airQuality) + "}";
         return json;
     }
 };
@@ -90,10 +83,7 @@ void connectToWiFi() {
     delay(1000);
     WiFi.begin(ssid, password);
 
-    unsigned long startAttemptTime = millis();
-    const unsigned long timeout = 10000; // 10 seconds timeout
-
-    while (WiFi.status() != WL_CONNECTED && (millis() - startAttemptTime) < timeout) {
+    while (WiFi.status() != WL_CONNECTED) {
         Serial.print(".");
         delay(500);
     }
@@ -110,7 +100,7 @@ void connectToWiFi() {
 void connectToMQTT() {
     while (!mqttClient.connected()) {
         Serial.print("Connecting to MQTT broker...");
-        if (mqttClient.connect("ESP32Client")) { // MQTT client ID
+        if (mqttClient.connect("ESP32Client")) {
             Serial.println(" connected!");
         } else {
             Serial.print(" Failed, rc=");
@@ -121,84 +111,186 @@ void connectToMQTT() {
     }
 }
 
+void sendToAPI(const String& table, float value) {
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFiClient wifiClient;
+        HttpClient client(wifiClient, serverAddress, serverPort);
+
+        // Prepare JSON payload
+        String payload = "{";
+        payload += "\"table\":\"" + table + "\",";
+        payload += "\"datetime\":\"" + timeClient.getFormattedTime() + "\",";
+        payload += "\"waarde\":" + String(value, 2);
+        payload += "}";
+
+        Serial.println("Sending data to API: " + payload);
+
+        client.beginRequest();
+        client.post("/api/insertdata"); // API endpoint to handle database insertion
+        client.sendHeader("Content-Type", "application/json");
+        client.sendHeader("Content-Length", payload.length());
+        client.beginBody();
+        client.print(payload);
+        client.endRequest();
+        
+    } else {
+        Serial.println("Wi-Fi not connected. Can't send data to API.");
+    }
+}
+
 void setup() {
     Serial.begin(115200);
 
-    // Initialize the DS18B20 sensor
     sensors.begin();
-
-    // Initialize the KY Humidity Sensor
     KYSensor.begin();
 
     delay(2000);
 
-    // Connect to WiFi
     connectToWiFi();
 
-    // Configure MQTT client
     mqttClient.setServer(mqtt_server, mqtt_port);
     connectToMQTT();
 
-    // Set motor pins as outputs
     pinMode(IN1, OUTPUT);
     pinMode(IN2, OUTPUT);
     pinMode(IN3, OUTPUT);
     pinMode(IN4, OUTPUT);
 
     pinMode(airQualitySensorPin, INPUT);
+
+    server.begin();
+    Serial.println("Server started");
+
+    timeClient.begin();
 }
 
-// Create an instance of SensorData
 SensorData sensorData;
 
 void loop() {
-    // Ensure WiFi connection
+    delay(1000);
+    Serial.println(WiFi.localIP());
+
+    counter++;
+
+    Serial.print("Looping");
+    Serial.println(counter);
+    // Reconnect to Wi-Fi if disconnected
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("Disconnected from WiFi. Reconnecting...");
         connectToWiFi();
     }
 
-    // Ensure MQTT connection
+    // Reconnect to MQTT broker if disconnected
     if (!mqttClient.connected()) {
         Serial.println("Disconnected from MQTT broker. Reconnecting...");
         connectToMQTT();
     }
 
-    mqttClient.loop(); // Maintain MQTT connection
+    mqttClient.loop();
 
-    // Request temperature from the DS18B20 sensor
+    // Read sensor data
     sensors.requestTemperatures();
-    float tempDS18B20 = sensors.getTempCByIndex(0);
+    float tempDS18B20 = sensors.getTempCByIndex(0); // Temperature sensor
+    airQualityValue = analogRead(airQualitySensorPin); // Air quality sensor
+    float humidityKYSensor = KYSensor.readHumidity(); // Humidity sensor
 
-    // Read air quality sensor
-    airQualityValue = analogRead(airQualitySensorPin);
-
-    // Read humidity from the KY Humidity Sensor
-    float humidityKYSensor = KYSensor.readHumidity();
-
-    // Set values in the SensorData object
+    // Update sensor data object
     sensorData.setTemperature(tempDS18B20);
     sensorData.setAirQuality(airQualityValue);
 
-    if (isnan(humidityKYSensor)) {
-        Serial.println("Failed to read from KY Sensor!");
-    } else {
+    if (!isnan(humidityKYSensor)) {
         sensorData.setHumidity(humidityKYSensor);
     }
 
-    // Publish the sensor data to MQTT
-    if (mqttClient.connected()) {
-        String payload = sensorData.toJSON();
-        Serial.print("Publishing message: ");
-        Serial.println(payload);
+    // Publish and send to API every 30 iterations
+    if (counter == 30) {
+        counter = 0;
 
-        mqttClient.publish(mqtt_topic, payload.c_str());
+        Serial.print("Finished loop: ");
+        Serial.println(counter);
+
+        // Prepare payload for both MQTT and API
+        String payload = sensorData.toJSON();
+        timeClient.update();
+        payload = payload.substring(0, payload.length() - 1) + ",\"time\":\"" + timeClient.getFormattedTime() + "\"}";
+
+        // Publish to MQTT
+        if (mqttClient.connected()) {
+            Serial.print("Publishing to MQTT: ");
+            Serial.println(payload);
+            mqttClient.publish(mqtt_topic, payload.c_str());
+        } else {
+            Serial.println("Failed to publish to MQTT. MQTT client not connected.");
+            connectToMQTT(); // Reconnect if disconnected
+        }
+
+        // Send to API
+        sendToAPI("temperatuur", tempDS18B20); // Send temperature to API
+        sendToAPI("luchtvocht", humidityKYSensor); // Send humidity to API
+        sendToAPI("luchtkwaliteit", airQualityValue); // Send air quality to API
+
+        // Verify execution reaches here
+        Serial.println("Reset?");
     }
 
-    // Example motor drive logic
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    digitalWrite(IN3, HIGH); 
-    digitalWrite(IN4, LOW);
-    delay(2000);
+    // Handle incoming client messages
+    if(!server.available())
+    {
+        server.begin(); 
+    }
+    WiFiClient carClient = server.available();
+    if (carClient) {
+        Serial.println("Client connected");
+
+        if (carClient.connected()) {
+
+            if (carClient.available()) {
+                String message = carClient.readString();
+                Serial.print("Message received: ");
+                Serial.println(message);
+
+                // Control motor based on received message
+                if (message.indexOf('U') != -1) {
+                    Serial.println("Forward");
+                    digitalWrite(IN1, HIGH);
+                    digitalWrite(IN2, LOW);
+                    digitalWrite(IN3, HIGH);
+                    digitalWrite(IN4, LOW);
+                } else if (message.indexOf('L') != -1) {
+                    Serial.println("Left");
+                    digitalWrite(IN1, LOW);
+                    digitalWrite(IN2, HIGH);
+                    digitalWrite(IN3, HIGH);
+                    digitalWrite(IN4, LOW);
+                } else if (message.indexOf('R') != -1) {
+                    Serial.println("Right");
+                    digitalWrite(IN1, HIGH);
+                    digitalWrite(IN2, LOW);
+                    digitalWrite(IN3, LOW);
+                    digitalWrite(IN4, HIGH);
+                } else if (message.indexOf('D') != -1) {
+                    Serial.println("Down");
+                    digitalWrite(IN1, LOW);
+                    digitalWrite(IN2, HIGH);
+                    digitalWrite(IN3, LOW);
+                    digitalWrite(IN4, HIGH);
+                } else if (message.indexOf("stop") != -1) {
+                    Serial.println("Stop");
+                    digitalWrite(IN1, LOW);
+                    digitalWrite(IN2, LOW);
+                    digitalWrite(IN3, LOW);
+                    digitalWrite(IN4, LOW);
+                }
+            }
+        }
+        else{
+            // Reset motor state when client disconnects
+            digitalWrite(IN1, LOW);
+            digitalWrite(IN2, LOW);
+            digitalWrite(IN3, LOW);
+            digitalWrite(IN4, LOW);
+            Serial.println("Client disconnected.");
+        }
+
+    }
 }
